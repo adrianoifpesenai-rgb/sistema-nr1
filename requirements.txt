@@ -4,3 +4,4 @@ matplotlib
 reportlab
 openpyxl
 xlrd
+psycopg2-binary
