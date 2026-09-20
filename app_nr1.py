@@ -488,7 +488,7 @@ def registrar_auditoria(usuario: str, acao: str, arquivo: str = "") -> None:
             INSERT INTO auditoria_nr1 (usuario, acao, data_hora, arquivo)
             VALUES (%s, %s, %s, %s)
             """,
-            (usuario, acao, agora_str(), arquivo),
+            (usuario, acao, datetime.now(), arquivo),
         ).close()
         conn.commit()
 
@@ -502,7 +502,7 @@ def criar_admin_padrao(conn: ConexaoPostgreSQL) -> None:
         return
 
     senha_hash, salt = gerar_hash_senha(ADMIN_SENHA)
-    agora = agora_str()
+    agora = datetime.now()
     conn.execute(
         """
         INSERT INTO usuarios_nr1 (
@@ -591,7 +591,7 @@ def cadastrar_colaborador(nome: str, usuario: str, senha: str) -> tuple[bool, st
             INSERT INTO usuarios_nr1 (nome, usuario, senha_hash, salt, perfil, status, criado_em)
             VALUES (%s, %s, %s, %s, 'COLABORADOR', 'PENDENTE', %s)
             """,
-            (nome, usuario, senha_hash, salt, agora_str()),
+            (nome, usuario, senha_hash, salt, datetime.now()),
         ).close()
         conn.commit()
         return True, "Cadastro realizado. Aguarde a liberação pelo administrador."
@@ -621,7 +621,7 @@ def alterar_status_usuario(user_id: int, novo_status: str, aprovador: str) -> No
             SET status = %s, aprovado_em = %s, aprovado_por = %s
             WHERE id = %s
             """,
-            (novo_status, agora_str(), aprovador, user_id),
+            (novo_status, datetime.now(), aprovador, user_id),
         ).close()
         conn.commit()
 
