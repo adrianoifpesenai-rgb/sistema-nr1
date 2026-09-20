@@ -8,7 +8,8 @@ import math
 import re
 import html
 import secrets
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import tempfile
 
 import pandas as pd
@@ -42,7 +43,6 @@ from reportlab.platypus import (
 
 # Caminhos dos Arquivos do Sistema
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "app_database.db"
 LOGO_PATH = BASE_DIR / "logo_escritorio.png"
 QRCODE_PATH = BASE_DIR / "qrcode_whatsapp.png"
 
@@ -313,7 +313,7 @@ st.markdown(
 
 
 # ============================================================
-# BANCO DE DADOS
+# BANCO DE DADOS - SUPABASE / POSTGRESQL
 # ============================================================
 
 COLUNAS_USUARIOS = [
@@ -326,54 +326,141 @@ COLUNAS_AUDITORIA = [
 ]
 
 
-def conectar_banco() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
+class ConexaoPostgreSQL:
+    """Adaptador simples para manter a mesma interface usada pelo sistema."""
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, query: str, params=None):
+        cursor = self._connection.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(query, params)
+        return cursor
+
+    def commit(self):
+        self._connection.commit()
+
+    def rollback(self):
+        self._connection.rollback()
+
+    def close(self):
+        self._connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is not None:
+                self._connection.rollback()
+        finally:
+            self._connection.close()
+        return False
 
 
-def criar_tabelas(conn: sqlite3.Connection) -> None:
+def conectar_banco() -> ConexaoPostgreSQL:
+    try:
+        database_url = st.secrets["postgres"]["url"]
+    except Exception as exc:
+        raise RuntimeError(
+            'A conexão com o Supabase não foi configurada. '
+            'Cadastre [postgres].url nos Secrets do Streamlit Cloud.'
+        ) from exc
+
+    if not database_url:
+        raise RuntimeError(
+            'O Secret "postgres.url" está vazio. Configure a URL de conexão do Supabase.'
+        )
+
+    connection = psycopg2.connect(database_url)
+    return ConexaoPostgreSQL(connection)
+
+
+def criar_tabelas(conn: ConexaoPostgreSQL) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS usuarios_nr1 (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             nome TEXT NOT NULL,
             usuario TEXT NOT NULL UNIQUE,
             senha_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
             perfil TEXT NOT NULL DEFAULT 'COLABORADOR',
             status TEXT NOT NULL DEFAULT 'PENDENTE',
-            criado_em TEXT NOT NULL,
-            aprovado_em TEXT,
-            aprovado_por TEXT
+            criado_em TIMESTAMP NOT NULL,
+            aprovado_em TIMESTAMP NULL,
+            aprovado_por TEXT NULL
         )
         """
-    )
+    ).close()
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS auditoria_nr1 (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             usuario TEXT,
             acao TEXT NOT NULL,
-            data_hora TEXT NOT NULL,
+            data_hora TIMESTAMP NOT NULL,
             arquivo TEXT
         )
         """
-    )
+    ).close()
     conn.commit()
 
 
-def esquema_compativel(conn: sqlite3.Connection) -> bool:
+def esquema_compativel(conn: ConexaoPostgreSQL) -> bool:
     try:
-        integridade = conn.execute("PRAGMA integrity_check").fetchone()[0]
-        if str(integridade).lower() != "ok":
+        tabelas = {
+            row["table_name"]
+            for row in conn.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name IN ('usuarios_nr1', 'auditoria_nr1')
+                """
+            ).fetchall()
+        }
+
+        if "usuarios_nr1" not in tabelas or "auditoria_nr1" not in tabelas:
             return False
 
-        cols_usuarios = [row[1] for row in conn.execute("PRAGMA table_info(usuarios_nr1)").fetchall()]
-        cols_auditoria = [row[1] for row in conn.execute("PRAGMA table_info(auditoria_nr1)").fetchall()]
+        cols_usuarios = [
+            row["column_name"]
+            for row in conn.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                ("usuarios_nr1",),
+            ).fetchall()
+        ]
 
-        return cols_usuarios == COLUNAS_USUARIOS and cols_auditoria == COLUNAS_AUDITORIA
+        cols_auditoria = [
+            row["column_name"]
+            for row in conn.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                ("auditoria_nr1",),
+            ).fetchall()
+        ]
+
+        if cols_usuarios != COLUNAS_USUARIOS:
+            return False
+        if cols_auditoria != COLUNAS_AUDITORIA:
+            return False
+
+        return True
     except Exception:
+        conn.rollback()
         return False
 
 
@@ -399,17 +486,18 @@ def registrar_auditoria(usuario: str, acao: str, arquivo: str = "") -> None:
         conn.execute(
             """
             INSERT INTO auditoria_nr1 (usuario, acao, data_hora, arquivo)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
             """,
             (usuario, acao, agora_str(), arquivo),
-        )
+        ).close()
         conn.commit()
 
 
-def criar_admin_padrao(conn: sqlite3.Connection) -> None:
+def criar_admin_padrao(conn: ConexaoPostgreSQL) -> None:
     total_usuarios = conn.execute(
-        "SELECT COUNT(*) FROM usuarios_nr1"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS total FROM usuarios_nr1"
+    ).fetchone()["total"]
+
     if total_usuarios > 0:
         return
 
@@ -417,22 +505,22 @@ def criar_admin_padrao(conn: sqlite3.Connection) -> None:
     agora = agora_str()
     conn.execute(
         """
-        INSERT INTO usuarios_nr1 (nome, usuario, senha_hash, salt, perfil, status, criado_em, aprovado_em, aprovado_por)
-        VALUES (?, ?, ?, ?, 'ADMIN', 'LIBERADO', ?, ?, 'SISTEMA')
+        INSERT INTO usuarios_nr1 (
+            nome, usuario, senha_hash, salt, perfil, status,
+            criado_em, aprovado_em, aprovado_por
+        )
+        VALUES (%s, %s, %s, %s, 'ADMIN', 'LIBERADO', %s, %s, 'SISTEMA')
         """,
         (ADMIN_NOME, ADMIN_USUARIO, senha_hash, salt, agora, agora),
-    )
+    ).close()
     conn.commit()
 
 
 def recriar_banco_completo() -> None:
-    try:
-        if DB_PATH.exists():
-            DB_PATH.unlink()
-    except Exception:
-        pass
-
     with conectar_banco() as conn:
+        conn.execute("DROP TABLE IF EXISTS auditoria_nr1").close()
+        conn.execute("DROP TABLE IF EXISTS usuarios_nr1").close()
+        conn.commit()
         criar_tabelas(conn)
         criar_admin_padrao(conn)
 
@@ -441,8 +529,13 @@ def inicializar_banco() -> None:
     try:
         with conectar_banco() as conn:
             if not esquema_compativel(conn):
-                recriar_banco_completo()
+                conn.execute("DROP TABLE IF EXISTS auditoria_nr1").close()
+                conn.execute("DROP TABLE IF EXISTS usuarios_nr1").close()
+                conn.commit()
+                criar_tabelas(conn)
+                criar_admin_padrao(conn)
                 return
+
             criar_tabelas(conn)
             criar_admin_padrao(conn)
     except Exception:
@@ -453,15 +546,16 @@ def inicializar_banco() -> None:
 # USUÁRIOS
 # ============================================================
 
-def buscar_usuario(usuario: str) -> sqlite3.Row:
+def buscar_usuario(usuario: str) -> dict | None:
     with conectar_banco() as conn:
-        return conn.execute(
-            "SELECT * FROM usuarios_nr1 WHERE LOWER(usuario) = LOWER(?)",
+        cursor = conn.execute(
+            "SELECT * FROM usuarios_nr1 WHERE LOWER(usuario) = LOWER(%s)",
             (usuario.strip(),),
-        ).fetchone()
+        )
+        return cursor.fetchone()
 
 
-def autenticar(usuario: str, senha: str) -> sqlite3.Row:
+def autenticar(usuario: str, senha: str) -> dict | None:
     usuario_db = buscar_usuario(usuario)
     if usuario_db is None or usuario_db["status"] != "LIBERADO":
         return None
@@ -484,7 +578,8 @@ def cadastrar_colaborador(nome: str, usuario: str, senha: str) -> tuple[bool, st
 
     with conectar_banco() as conn:
         existente = conn.execute(
-            "SELECT id FROM usuarios_nr1 WHERE LOWER(usuario) = LOWER(?)", (usuario,)
+            "SELECT id FROM usuarios_nr1 WHERE LOWER(usuario) = LOWER(%s)",
+            (usuario,),
         ).fetchone()
 
         if existente:
@@ -494,15 +589,15 @@ def cadastrar_colaborador(nome: str, usuario: str, senha: str) -> tuple[bool, st
         conn.execute(
             """
             INSERT INTO usuarios_nr1 (nome, usuario, senha_hash, salt, perfil, status, criado_em)
-            VALUES (?, ?, ?, ?, 'COLABORADOR', 'PENDENTE', ?)
+            VALUES (%s, %s, %s, %s, 'COLABORADOR', 'PENDENTE', %s)
             """,
             (nome, usuario, senha_hash, salt, agora_str()),
-        )
+        ).close()
         conn.commit()
         return True, "Cadastro realizado. Aguarde a liberação pelo administrador."
 
 
-def listar_usuarios() -> list[sqlite3.Row]:
+def listar_usuarios() -> list[dict]:
     with conectar_banco() as conn:
         return conn.execute(
             """
@@ -523,11 +618,11 @@ def alterar_status_usuario(user_id: int, novo_status: str, aprovador: str) -> No
         conn.execute(
             """
             UPDATE usuarios_nr1
-            SET status = ?, aprovado_em = ?, aprovado_por = ?
-            WHERE id = ?
+            SET status = %s, aprovado_em = %s, aprovado_por = %s
+            WHERE id = %s
             """,
             (novo_status, agora_str(), aprovador, user_id),
-        )
+        ).close()
         conn.commit()
 
 
